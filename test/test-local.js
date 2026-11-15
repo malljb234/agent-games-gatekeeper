@@ -106,6 +106,50 @@ function postWithSig(raw, sigValue, extraHeaders = {}) {
     req.end(raw);
   });
 }
+function postRaw(raw, headers = {}) {
+  // POST with exactly the caller-supplied headers (no signature header
+  // unless the caller adds one) — needed for the "signature" header
+  // cases, where x-agent-games-signature must be ABSENT or wrong.
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      `${BASE}/task`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(raw),
+          ...headers,
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode,
+            headers: res.headers,
+            raw: Buffer.concat(chunks).toString("utf8"),
+          })
+        );
+      }
+    );
+    req.on("error", reject);
+    req.end(raw);
+  });
+}
+function hmacFor(algo, key, payload) {
+  // Same digest rules as lib/gatekeeper.js (incl. truncated variants).
+  if (algo === "sha384-trunc32")
+    return crypto.createHmac("sha384", key).update(payload).digest().subarray(0, 32);
+  if (algo === "sha512-trunc32")
+    return crypto.createHmac("sha512", key).update(payload).digest().subarray(0, 32);
+  return crypto.createHmac(algo, key).update(payload).digest();
+}
+function encodeSig(buf, enc) {
+  if (enc === "base64") return buf.toString("base64");
+  if (enc === "base64url") return buf.toString("base64url");
+  return buf.toString("hex");
+}
 function get(pathname) {
   return new Promise((resolve, reject) => {
     http.get(`${BASE}${pathname}`, (res) => {
@@ -133,6 +177,14 @@ function checkResponseSignature(r) {
   if (!sig) return false;
   const expected = crypto.createHmac("sha256", SECRET).update(r.raw).digest("hex");
   return sig === expected;
+}
+function checkResponseSignatureAlgo(r, algo, key, enc = "hex") {
+  // Response must be signed with the SAME hash + encoding that matched
+  // the incoming request (round 3: a SHA-384/base64 platform gets a
+  // SHA-384/base64 response signature, not SHA-256 hex).
+  const sig = r.headers["x-agent-games-signature"];
+  if (!sig) return false;
+  return sig === encodeSig(hmacFor(algo, key, r.raw), enc);
 }
 
 let pass = 0;
@@ -358,6 +410,150 @@ function assert(label, cond, extra = "") {
     rawV = JSON.stringify(envObj, null, 2);
     r = await postWithSig(rawV, hmacBuf("wrong-secret", canonicalJson(JSON.parse(rawV))).toString("hex"));
     assert("canonical payload + wrong key still 401", r.status === 401, `status=${r.status}`);
+
+    console.log("== round-3 variants (live preflight still 401 after round-2 fix) ==");
+    // The live preflight (14:47:28 WIB, req eede5c49) is a 171-byte
+    // envelope {type, agent_id, issued_at, nonce} with BOTH an
+    // x-agent-games-signature AND a separate "signature" header, and a
+    // 64-char signature. Round 2 never tried the "signature" header,
+    // non-SHA-256 hashes, agent-id-bound keys, or field-only payloads.
+    // Each case below signs one round-3 construction with the test
+    // secret and must APPROVE.
+    const PREFLIGHT_AGENT_ID = "8609c8b4-8440-42f6-889a-021a4d3bf4c2"; // agent_id UUID from the live preflight body (not secret)
+    function preflightEnvelope(taskId, input, extra = {}) {
+      return {
+        type: "agent-games.preflight.v1",
+        agent_id: PREFLIGHT_AGENT_ID,
+        issued_at: new Date().toISOString(),
+        nonce: crypto.randomUUID(),
+        task_id: taskId,
+        mode: "competition",
+        input,
+        ...extra,
+      };
+    }
+    function variantTx3(n) {
+      return "0x" + n.toString(16).padStart(2, "0") + "c7" + "0".repeat(56) + "8ff7";
+    }
+    const r3 = (n) => validInput({ proof_tx: variantTx3(n) });
+
+    // 1. Signature carried ONLY in the "signature" header (no
+    //    x-agent-games-signature at all).
+    rawV = JSON.stringify(preflightEnvelope("gk_test_r3_sighdr", r3(0xe1)));
+    r = await postRaw(rawV, {
+      signature: hmacFor("sha256", SECRET, rawV).toString("hex"),
+    });
+    body = JSON.parse(r.raw);
+    assert("signature header only approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 2. x-agent-games-signature WRONG but "signature" correct — any
+    //    present signature header that verifies must be accepted.
+    rawV = JSON.stringify(preflightEnvelope("gk_test_r3_sighdr2", r3(0xe2)));
+    r = await postRaw(rawV, {
+      "x-agent-games-signature": hmacFor("sha256", "wrong-secret", rawV).toString("hex"),
+      signature: hmacFor("sha256", SECRET, rawV).toString("hex"),
+    });
+    body = JSON.parse(r.raw);
+    assert("wrong x-header + correct signature header approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 3. HMAC-SHA-384, base64-encoded (48 bytes -> exactly 64 chars,
+    //    matching the live sig_len=64). Response must come back
+    //    SHA-384/base64-signed too.
+    rawV = JSON.stringify(preflightEnvelope("gk_test_r3_sha384", r3(0xe3)));
+    r = await postWithSig(rawV, encodeSig(hmacFor("sha384", SECRET, rawV), "base64"));
+    body = JSON.parse(r.raw);
+    assert("sha384 + base64 sig approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+    assert("sha384 response is sha384/base64 signed", checkResponseSignatureAlgo(r, "sha384", SECRET, "base64"));
+
+    // 4. HMAC-SHA-512/256, hex.
+    rawV = JSON.stringify(preflightEnvelope("gk_test_r3_sha512256", r3(0xe4)));
+    r = await postWithSig(rawV, encodeSig(hmacFor("sha512-256", SECRET, rawV), "hex"));
+    body = JSON.parse(r.raw);
+    assert("sha512-256 hex sig approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 5. HMAC-SHA-512 truncated to 32 bytes, hex.
+    rawV = JSON.stringify(preflightEnvelope("gk_test_r3_sha512trunc", r3(0xe5)));
+    r = await postWithSig(rawV, encodeSig(hmacFor("sha512-trunc32", SECRET, rawV), "hex"));
+    body = JSON.parse(r.raw);
+    assert("sha512-trunc32 hex sig approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 6. HMAC-SHA-384 truncated to 32 bytes, hex.
+    rawV = JSON.stringify(preflightEnvelope("gk_test_r3_sha384trunc", r3(0xe6)));
+    r = await postWithSig(rawV, encodeSig(hmacFor("sha384-trunc32", SECRET, rawV), "hex"));
+    body = JSON.parse(r.raw);
+    assert("sha384-trunc32 hex sig approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 7. Key = SHA256(secret + body agent_id).
+    let envR3 = preflightEnvelope("gk_test_r3_keyagent", r3(0xe7));
+    rawV = JSON.stringify(envR3);
+    r = await postWithSig(rawV, hmacFor("sha256", crypto.createHash("sha256").update(SECRET + PREFLIGHT_AGENT_ID).digest(), rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("sha256(secret+agentid) key approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 8. Key = HMAC-SHA256(secret, body agent_id).
+    envR3 = preflightEnvelope("gk_test_r3_keyhmac", r3(0xe8));
+    rawV = JSON.stringify(envR3);
+    r = await postWithSig(rawV, hmacFor("sha256", crypto.createHmac("sha256", SECRET).update(PREFLIGHT_AGENT_ID).digest(), rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("hmac(secret,agentid) key approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 9. Key = SHA256(secret + "agent-games").
+    envR3 = preflightEnvelope("gk_test_r3_keyag", r3(0xe9));
+    rawV = JSON.stringify(envR3);
+    r = await postWithSig(rawV, hmacFor("sha256", crypto.createHash("sha256").update(SECRET + "agent-games").digest(), rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("sha256(secret+agent-games) key approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 10. Payload = the nonce field alone.
+    envR3 = preflightEnvelope("gk_test_r3_nonce", r3(0xea));
+    rawV = JSON.stringify(envR3);
+    r = await postWithSig(rawV, hmacFor("sha256", SECRET, envR3.nonce).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("nonce-only payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 11. Payload = type + nonce.
+    envR3 = preflightEnvelope("gk_test_r3_typenonce", r3(0xeb));
+    rawV = JSON.stringify(envR3);
+    r = await postWithSig(rawV, hmacFor("sha256", SECRET, envR3.type + envR3.nonce).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("type+nonce payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 12. Payload = agent_id + nonce.
+    envR3 = preflightEnvelope("gk_test_r3_agentnonce", r3(0xec));
+    rawV = JSON.stringify(envR3);
+    r = await postWithSig(rawV, hmacFor("sha256", SECRET, envR3.agent_id + envR3.nonce).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("agentid+nonce payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 13. Payload = canonical JSON of the envelope WITHOUT the type field.
+    envR3 = preflightEnvelope("gk_test_r3_notype", r3(0xed));
+    rawV = JSON.stringify(envR3);
+    const { type: _t, ...noType } = envR3;
+    r = await postWithSig(rawV, hmacFor("sha256", SECRET, canonicalJson(noType)).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("no-type canonical payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 14. Signature = hex with a 0x prefix.
+    envR3 = preflightEnvelope("gk_test_r3_0x", r3(0xee));
+    rawV = JSON.stringify(envR3);
+    r = await postWithSig(rawV, "0x" + hmacFor("sha256", SECRET, rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("0x-prefixed hex sig approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 15. Negative control: SHA-384 + base64 with a WRONG key.
+    envR3 = preflightEnvelope("gk_test_r3_sha384wrong", r3(0xef));
+    rawV = JSON.stringify(envR3);
+    r = await postWithSig(rawV, encodeSig(hmacFor("sha384", "wrong-secret", rawV), "base64"));
+    assert("sha384 + wrong key still 401", r.status === 401, `status=${r.status}`);
+
+    // 16. Negative control: BOTH signature headers wrong.
+    envR3 = preflightEnvelope("gk_test_r3_bothwrong", r3(0xf0));
+    rawV = JSON.stringify(envR3);
+    r = await postRaw(rawV, {
+      "x-agent-games-signature": hmacFor("sha256", "wrong-secret", rawV).toString("hex"),
+      signature: hmacFor("sha256", "wrong-secret-2", rawV).toString("hex"),
+    });
+    assert("both signature headers wrong still 401", r.status === 401, `status=${r.status}`);
   } finally {
     server.kill("SIGTERM");
   }
