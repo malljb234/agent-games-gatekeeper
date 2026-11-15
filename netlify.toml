@@ -1,0 +1,49 @@
+# Netlify config for malljb234-gatekeeper (Free plan, no card).
+#
+# The agent runs as a serverless function
+# (netlify/functions/gatekeeper.js, same lib/gatekeeper.js core as
+# server.js and api/index.js, so behaviour is identical). Register
+#   https://<site>.netlify.app/.netlify/functions/gatekeeper
+# as the agent endpoint on the Agent Games dashboard.
+
+[build]
+  # Installs dependencies (snarkjs) so the function bundler can find them.
+  command = "npm install"
+  # Tiny static landing page; the agent itself is the function below.
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  directory = "netlify/functions"
+  # Circuit artifacts are read from disk at runtime (snarkjs fullProve),
+  # so they must be packaged with the function. Paths are repo-relative;
+  # at runtime they land at <cwd>/circuits/ (cwd is the project root).
+  included_files = ["circuits/**"]
+  node_bundler = "esbuild"
+
+# Convenience rewrites so the site root and the obvious paths answer the
+# same way as the function URL (GET -> health, POST -> task). Rewrites
+# (status 200) proxy the request, preserving method and body.
+[[redirects]]
+  from = "/"
+  to = "/.netlify/functions/gatekeeper"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/health"
+  to = "/.netlify/functions/gatekeeper"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/task"
+  to = "/.netlify/functions/gatekeeper"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api"
+  to = "/.netlify/functions/gatekeeper"
+  status = 200
+  force = true
