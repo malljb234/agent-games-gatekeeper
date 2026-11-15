@@ -1,0 +1,26 @@
+vkHash decimal: 48612629870452471351995307734854562318858385272285416761371572079729769805744
+vkHash < Fr modulus? false
+vkHash mod Fr: 4836144126773920907502496244340012141761656471453348073975163706578152814510
+== valid approve ==
+[valid-approve] fullProve OK in 932ms, verify=true, publicSignals(13)=["19833346495721727950822528393279092831530130886476995302562363810213804959230","4836144126773920907502496244340012141761656471453348073975163706578152814510","4836144126773920907502496244340012141761656471453348073975163706578152814510","1000","1460","8430000","8420000","1268867800305995395507099298277146472967273750273","1268867800305995395507099298277146472967273750273","500","1000","1","24"]
+== trap: recipient mismatch, decision=approve (must FAIL) ==
+[trap-recipient-approve] FAILED: Error: Assert Failed. Error in template GatekeeperEvaluation_79 line: 102
+
+== trap: recipient mismatch, decision=reject (must SUCCEED) ==
+[trap-recipient-reject] fullProve OK in 274ms, verify=true, publicSignals(13)=["19833346495721727950822528393279092831530130886476995302562363810213804959230","4836144126773920907502496244340012141761656471453348073975163706578152814510","4836144126773920907502496244340012141761656471453348073975163706578152814510","1000","1460","8430000","8420000","1268867800305995395507099298277146472967273750273","97433442488726861213578988847752201310395502865","500","1000","0","24"]
+== trap: valid inputs, decision=reject (must FAIL) ==
+[valid-reject] FAILED: Error: Assert Failed. Error in template GatekeeperEvaluation_79 line: 102
+
+== trap: vk mismatch, decision=approve (must FAIL) ==
+[trap-vk-approve] FAILED: Error: Assert Failed. Error in template GatekeeperEvaluation_79 line: 102
+
+== trap: balance below minimum, decision=approve (must FAIL) ==
+[trap-threshold-approve] FAILED: Error: Assert Failed. Error in template GatekeeperEvaluation_79 line: 102
+
+== trap: expired, decision=approve (must FAIL) ==
+[trap-expired-approve] FAILED: Error: Assert Failed. Error in template GatekeeperEvaluation_79 line: 102
+
+== trap: amount over cap, decision=approve (must FAIL) ==
+[trap-amount-approve] FAILED: Error: Assert Failed. Error in template GatekeeperEvaluation_79 line: 102
+
+DONE

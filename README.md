@@ -1,0 +1,102 @@
+# malljb234-gatekeeper
+
+Proof Gatekeeper agent for **zkVerify Agent Games — Season 01** (21 Oct – 21 Nov 2026).
+Track: **Proof Gatekeeper** (100,000 VFY prize pool for the track: 50k / 30k / 20k).
+Agent: **malljb234-gatekeeper** · owner `@malljb238` · GitHub `malljb234`.
+
+## What it does
+
+A public HTTPS endpoint. The platform POSTs a signed task envelope describing
+a transfer request; the agent has 60 seconds to decide APPROVE or REJECT and
+prove the decision with a Groth16 zero-knowledge proof that the platform
+re-verifies against its own registered verification key.
+
+1. **Verify the HMAC signature on the raw request body** before parsing
+   anything. Bad signature → 401, no further work.
+2. **Decide deterministically** — a fixed checklist over the task fields
+   (official trap encyclopedia, 7 varieties):
+   - `proof_vk` must equal `registered_vk` and the registered key, else
+     `VK_SUBSTITUTION`
+   - `public_balance >= minimum`, else `THRESHOLD_MISMATCH`
+   - `expiry_block > current_block`, else `EXPIRED_CONDITION`
+   - `recipient == condition_recipient`, else `RECIPIENT_MISMATCH`
+   - `amount <= max_transfer`, else `AMOUNT_OVERFLOW`
+   - `proof_tx` not seen before, else `PROOF_REUSED` (rejected with no
+     proof — the tournament excludes those from the proof bonus)
+   - all checks pass → `VALID_CONDITION` / APPROVE
+3. **Generate a Groth16 proof** of that decision with snarkjs 0.7.6 and the
+   tournament's own gatekeeper circuit (BN254, Circom 2.x), and return the
+   proof + public signals in the HMAC-signed response.
+4. **Fail closed.** Any error, timeout, or uncertainty → REJECT.
+5. **Remember.** Task IDs and proof references persist in `state.json`, so
+   a re-submitted proof is rejected and a retried task returns the
+   identical cached response.
+
+Scoring (official): correct APPROVE/REJECT +12, wrong APPROVE −6, wrong
+REJECT −3, timeout −2, missing/invalid proof −2, reliability bonus +0…+5.
+
+## Circuit (verified against official sources)
+
+- Circuit files downloaded from the official site:
+  `https://agentgames.zkverify.io/circuits/gatekeeper.wasm` (1,755,820 bytes)
+  and `gatekeeper_final.zkey` (309,750 bytes).
+- Registered verification-key hash, from the official
+  `https://agentgames.zkverify.io/api/circuit-info`:
+  `0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0`
+- `circuits/verification_key.json` was exported from the official zkey with
+  `snarkjs zkey export verificationkey` (protocol groth16, curve bn128,
+  nPublic 13).
+- The circuit's 13 input signals were confirmed by running the official
+  wasm+zkey locally (see `probe-circuit.js`):
+  `registeredVkHash, proofVkHash, minimum, publicBalance, expiryBlock,
+  currentBlock, recipient, conditionRecipient, amount, maxTransfer,
+  decision, taskId, salt`.
+
+## Run locally
+
+```bash
+npm install
+AGENT_GAMES_HMAC_SECRET=<secret from the Agent Games dashboard> node server.js
+# GET  /health  -> {"status":"ok", ...}
+# POST /  or  POST /task  (HMAC-signed task envelope)
+```
+
+The HMAC secret is the per-agent secret from the Agent Games dashboard
+("Rotate Secret"). **Never commit it.** Without it the server answers
+`/health` only and returns 503 for tasks.
+
+## Tests
+
+```bash
+node probe-circuit.js   # circuit truth: valid approve proves; trap approves
+                        # and wrong rejects fail to prove; trap rejects prove
+node test/test-local.js # end-to-end HTTP: approve, trap, reuse, replay,
+                        # bad HMAC (401), unsigned (401), no secret (503)
+```
+
+## Deploy (Render free tier)
+
+1. Sign up at render.com with GitHub (free, no card) and connect this repo.
+2. New → Web Service → pick this repo → Runtime Node → Build command
+   `npm install` → Start command `node server.js` → Free plan.
+3. Add environment variable `AGENT_GAMES_HMAC_SECRET` = the secret from
+   the Agent Games dashboard. (Do **not** put it in the repo.)
+4. Deploy, copy the `https://<name>.onrender.com` URL, and register it as
+   the agent endpoint at
+   https://agentgames.zkverify.io/dashboard/agents (Proof Gatekeeper).
+5. Keep the free instance warm: Render's free tier spins down after ~15 min
+   idle and a cold start can eat most of the 60-second window. Ping
+   `https://<name>.onrender.com/health` every few minutes (e.g. a cron job
+   or an uptime monitor) so the first task of a round does not time out.
+6. In the Agent Games dashboard, run the signed preflight and at least one
+   practice task before the next scored round.
+
+## Event schedule (official)
+
+8 daily scored rounds, 13–21 Nov 2026, 4:00 PM–2:00 AM IST
+(= 17:30–03:30 WIB), 8 tasks per agent per round. Rounds 1–2 (13–14 Nov)
+already ran; rounds 3–8 run 15–20 Nov. Registration closes 21 Nov 2026.
+
+## License
+
+MIT — see `LICENSE`.

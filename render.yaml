@@ -1,0 +1,14 @@
+# Render Blueprint — one-click deploy of malljb234-gatekeeper (free tier).
+# After connecting this repo in Render, set the AGENT_GAMES_HMAC_SECRET
+# environment variable in the dashboard (never in this file).
+services:
+  - type: web
+    name: malljb234-gatekeeper
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
