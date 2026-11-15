@@ -165,7 +165,7 @@ function signedPost(taskId, input, secret = SECRET) {
     if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
     return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(v[k])).join(",") + "}";
   }
-  function platformPost({ taskId, input, displayedSecret, keyBytes, sigEncoding = "hex", timestamp = null, headerName = "x-agent-games-signature", payloadFn = null, envelopeExtra = {} }) {
+  function platformPost({ taskId, input, displayedSecret, keyBytes, sigEncoding = "hex", sigPrefix = "", hashAlgo = "sha256", timestamp = null, headerName = "x-agent-games-signature", extraHeaders = null, payloadFn = null, envelopeExtra = {} }) {
     process.env.AGENT_GAMES_HMAC_SECRET = displayedSecret;
     const env = { ...envelope(taskId, input), ...envelopeExtra };
     const raw = JSON.stringify(env);
@@ -176,12 +176,26 @@ function signedPost(taskId, input, secret = SECRET) {
       payload = Buffer.concat([Buffer.from(timestamp, "utf8"), Buffer.from("."), Buffer.from(raw, "utf8")]);
     }
     if (payloadFn) payload = payloadFn(raw, env);
-    const sigBuf = crypto.createHmac("sha256", keyBytes).update(payload).digest();
-    headers[headerName] =
+    const sigBuf = hmacFor(hashAlgo, keyBytes, payload);
+    headers[headerName] = sigPrefix + (
       sigEncoding === "base64" ? sigBuf.toString("base64") :
       sigEncoding === "base64url" ? sigBuf.toString("base64url") :
-      sigBuf.toString("hex");
+      sigBuf.toString("hex"));
+    if (extraHeaders) {
+      Object.assign(headers, typeof extraHeaders === "function" ? extraHeaders(raw, env) : extraHeaders);
+    }
     return { method: "POST", path: "/.netlify/functions/gatekeeper", headers, body: raw };
+  }
+  function hmacFor(algo, key, payload) {
+    // Same digest rules as lib/gatekeeper.js (incl. truncated variants).
+    if (algo === "sha384-trunc32") return crypto.createHmac("sha384", key).update(payload).digest().subarray(0, 32);
+    if (algo === "sha512-trunc32") return crypto.createHmac("sha512", key).update(payload).digest().subarray(0, 32);
+    return crypto.createHmac(algo, key).update(payload).digest();
+  }
+  function encodeSig(buf, enc) {
+    if (enc === "base64") return buf.toString("base64");
+    if (enc === "base64url") return buf.toString("base64url");
+    return buf.toString("hex");
   }
   function proofTx(n) {
     // 0x + 64 hex chars, unique per variant case.
@@ -330,6 +344,191 @@ function signedPost(taskId, input, secret = SECRET) {
     payloadFn: (raw) => Buffer.from(canonicalJson(JSON.parse(raw)), "utf8"),
   }));
   assert("r2 canonical payload + wrong key still 401", r.statusCode === 401, `status=${r.statusCode}`);
+
+  // ------------------------------------------------------------------
+  // ROUND 3 (2026-11-15 ~14:50 WIB): the live preflight STILL 401s
+  // with the round-2 fix deployed. Hard evidence (Netlify function log
+  // 14:47:28 WIB, req eede5c49): a 171-byte envelope {type,
+  // agent_id, issued_at, nonce} with BOTH an x-agent-games-signature
+  // AND a separate "signature" header, and a 64-char signature.
+  // Round 2 never tried the "signature" header, non-SHA-256 hashes,
+  // agent-id-bound keys, or field-only payloads. Each case signs one
+  // round-3 construction and must APPROVE.
+  // ------------------------------------------------------------------
+  console.log("== round-3 variants (live preflight still 401 after round-2 fix) ==");
+  const PREFLIGHT_AGENT_ID = "8609c8b4-8440-42f6-889a-021a4d3bf4c2"; // agent_id UUID from the live preflight body (not secret)
+  function proofTx3(n) {
+    // 0x + 64 hex chars, unique per round-3 case.
+    return "0x" + n.toString(16).padStart(2, "0") + "c7" + "0".repeat(56) + "8ff7";
+  }
+  function preflightExtra() {
+    return {
+      type: "agent-games.preflight.v1",
+      agent_id: PREFLIGHT_AGENT_ID,
+      issued_at: new Date().toISOString(),
+      nonce: crypto.randomUUID(),
+    };
+  }
+  const RAWKEY = Buffer.from(SECRET, "utf8");
+
+  // 1. Signature carried ONLY in the "signature" header.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_sighdr", input: validInput({ proof_tx: proofTx3(0xe1) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY, headerName: "signature",
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 signature header only approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 2. x-agent-games-signature WRONG but "signature" correct.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_sighdr2", input: validInput({ proof_tx: proofTx3(0xe2) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY, headerName: "signature",
+    envelopeExtra: preflightExtra(),
+    extraHeaders: (raw) => ({
+      "x-agent-games-signature": crypto.createHmac("sha256", "wrong-secret").update(raw).digest("hex"),
+    }),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 wrong x-header + correct signature header approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 3. HMAC-SHA-384, base64-encoded (48 bytes -> exactly 64 chars,
+  //    matching the live sig_len=64). Response must come back
+  //    SHA-384/base64-signed too.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_sha384", input: validInput({ proof_tx: proofTx3(0xe3) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY, hashAlgo: "sha384", sigEncoding: "base64",
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 sha384 + base64 sig approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+  assert("r3 sha384 response is sha384/base64 signed",
+    r.headers["x-agent-games-signature"] === encodeSig(hmacFor("sha384", SECRET, r.body), "base64"));
+
+  // 4. HMAC-SHA-512/256, hex.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_sha512256", input: validInput({ proof_tx: proofTx3(0xe4) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY, hashAlgo: "sha512-256",
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 sha512-256 hex sig approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 5. HMAC-SHA-512 truncated to 32 bytes, hex.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_sha512trunc", input: validInput({ proof_tx: proofTx3(0xe5) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY, hashAlgo: "sha512-trunc32",
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 sha512-trunc32 hex sig approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 6. HMAC-SHA-384 truncated to 32 bytes, hex.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_sha384trunc", input: validInput({ proof_tx: proofTx3(0xe6) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY, hashAlgo: "sha384-trunc32",
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 sha384-trunc32 hex sig approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 7. Key = SHA256(secret + body agent_id).
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_keyagent", input: validInput({ proof_tx: proofTx3(0xe7) }),
+    displayedSecret: SECRET, keyBytes: crypto.createHash("sha256").update(SECRET + PREFLIGHT_AGENT_ID).digest(),
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 sha256(secret+agentid) key approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 8. Key = HMAC-SHA256(secret, body agent_id).
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_keyhmac", input: validInput({ proof_tx: proofTx3(0xe8) }),
+    displayedSecret: SECRET, keyBytes: crypto.createHmac("sha256", SECRET).update(PREFLIGHT_AGENT_ID).digest(),
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 hmac(secret,agentid) key approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 9. Key = SHA256(secret + "agent-games").
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_keyag", input: validInput({ proof_tx: proofTx3(0xe9) }),
+    displayedSecret: SECRET, keyBytes: crypto.createHash("sha256").update(SECRET + "agent-games").digest(),
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 sha256(secret+agent-games) key approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 10. Payload = the nonce field alone.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_nonce", input: validInput({ proof_tx: proofTx3(0xea) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY,
+    envelopeExtra: preflightExtra(),
+    payloadFn: (raw, env) => Buffer.from(String(env.nonce), "utf8"),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 nonce-only payload approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 11. Payload = type + nonce.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_typenonce", input: validInput({ proof_tx: proofTx3(0xeb) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY,
+    envelopeExtra: preflightExtra(),
+    payloadFn: (raw, env) => Buffer.from(String(env.type) + String(env.nonce), "utf8"),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 type+nonce payload approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 12. Payload = agent_id + nonce.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_agentnonce", input: validInput({ proof_tx: proofTx3(0xec) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY,
+    envelopeExtra: preflightExtra(),
+    payloadFn: (raw, env) => Buffer.from(String(env.agent_id) + String(env.nonce), "utf8"),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 agentid+nonce payload approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 13. Payload = canonical JSON of the envelope WITHOUT the type field.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_notype", input: validInput({ proof_tx: proofTx3(0xed) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY,
+    envelopeExtra: preflightExtra(),
+    payloadFn: (raw, env) => {
+      const { type: _t, ...noType } = env;
+      return Buffer.from(canonicalJson(noType), "utf8");
+    },
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 no-type canonical payload approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 14. Signature = hex with a 0x prefix.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_0x", input: validInput({ proof_tx: proofTx3(0xee) }),
+    displayedSecret: SECRET, keyBytes: RAWKEY, sigPrefix: "0x",
+    envelopeExtra: preflightExtra(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r3 0x-prefixed hex sig approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 15. Negative control: SHA-384 + base64 with a WRONG key.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_sha384wrong", input: validInput({ proof_tx: proofTx3(0xef) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from("wrong-secret", "utf8"), hashAlgo: "sha384", sigEncoding: "base64",
+    envelopeExtra: preflightExtra(),
+  }));
+  assert("r3 sha384 + wrong key still 401", r.statusCode === 401, `status=${r.statusCode}`);
+
+  // 16. Negative control: BOTH signature headers signed with wrong keys.
+  r = await call(handler, platformPost({
+    taskId: "nt_r3_bothwrong", input: validInput({ proof_tx: proofTx3(0xf0) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from("wrong-secret", "utf8"), headerName: "signature",
+    envelopeExtra: preflightExtra(),
+    extraHeaders: (raw) => ({
+      "x-agent-games-signature": crypto.createHmac("sha256", "wrong-secret-2").update(raw).digest("hex"),
+    }),
+  }));
+  assert("r3 both signature headers wrong still 401", r.statusCode === 401, `status=${r.statusCode}`);
 
   // Restore the default test secret for any later checks.
   process.env.AGENT_GAMES_HMAC_SECRET = SECRET;
