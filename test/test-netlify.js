@@ -147,6 +147,93 @@ function signedPost(taskId, input, secret = SECRET) {
   assert("base64 body status 200", r.statusCode === 200, `status=${r.statusCode} ${r.body.slice(0, 200)}`);
   assert("base64 body decision", body.decision === "APPROVE", r.body.slice(0, 200));
 
+  // ------------------------------------------------------------------
+  // Platform signing variants (preflight 401 diagnosis, 2026-11-15).
+  // Official docs pin the header (x-agent-games-signature), HMAC over the
+  // raw body, and a 32-byte secret — but NOT how the 32 bytes are
+  // displayed (hex? base64?) nor the signature encoding (hex? base64?),
+  // nor whether a timestamp is mixed into the payload. The platform
+  // signs with the 32 RAW bytes; the dashboard shows them encoded. Each
+  // case below signs the way the platform plausibly does while the env
+  // var holds the displayed form — and must still APPROVE.
+  // ------------------------------------------------------------------
+  console.log("== platform variants: secret encodings / sig encodings ==");
+  const RAW32 = crypto.randomBytes(32); // the platform's 32 raw secret bytes
+  const WRONG32 = crypto.randomBytes(32);
+  function platformPost({ taskId, input, displayedSecret, keyBytes, sigEncoding = "hex", timestamp = null, headerName = "x-agent-games-signature" }) {
+    process.env.AGENT_GAMES_HMAC_SECRET = displayedSecret;
+    const raw = JSON.stringify(envelope(taskId, input));
+    let payload = Buffer.from(raw, "utf8");
+    const headers = { "content-type": "application/json" };
+    if (timestamp) {
+      headers["x-agent-games-timestamp"] = timestamp;
+      payload = Buffer.concat([Buffer.from(timestamp, "utf8"), Buffer.from("."), Buffer.from(raw, "utf8")]);
+    }
+    const sigBuf = crypto.createHmac("sha256", keyBytes).update(payload).digest();
+    headers[headerName] = sigEncoding === "base64" ? sigBuf.toString("base64") : sigBuf.toString("hex");
+    return { method: "POST", path: "/.netlify/functions/gatekeeper", headers, body: raw };
+  }
+  function proofTx(n) {
+    // 0x + 64 hex chars, unique per variant case.
+    return "0x" + n.toString(16).padStart(2, "0") + "c5" + "0".repeat(56) + "8ff5";
+  }
+
+  // 1. Secret displayed as HEX, platform signs with the raw 32 bytes.
+  r = await call(handler, platformPost({
+    taskId: "nt_var_hexkey", input: validInput({ proof_tx: proofTx(0xe1) }),
+    displayedSecret: RAW32.toString("hex"), keyBytes: RAW32,
+  }));
+  body = JSON.parse(r.body);
+  assert("variant hex-secret + raw-bytes key approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+  if (body.proof) {
+    const ok = await snarkjs.groth16.verify(VK, body.public_signals, body.proof);
+    assert("variant hex-secret proof verifies", ok === true);
+  }
+
+  // 2. Secret displayed as BASE64, platform signs with the raw 32 bytes.
+  r = await call(handler, platformPost({
+    taskId: "nt_var_b64key", input: validInput({ proof_tx: proofTx(0xe2) }),
+    displayedSecret: RAW32.toString("base64"), keyBytes: RAW32,
+  }));
+  body = JSON.parse(r.body);
+  assert("variant base64-secret + raw-bytes key approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 3. Raw string secret, BASE64-encoded signature.
+  r = await call(handler, platformPost({
+    taskId: "nt_var_b64sig", input: validInput({ proof_tx: proofTx(0xe3) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from(SECRET, "utf8"), sigEncoding: "base64",
+  }));
+  body = JSON.parse(r.body);
+  assert("variant raw secret + base64 sig approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 4. Hex secret + base64 signature together.
+  r = await call(handler, platformPost({
+    taskId: "nt_var_hex_b64", input: validInput({ proof_tx: proofTx(0xe4) }),
+    displayedSecret: RAW32.toString("hex"), keyBytes: RAW32, sigEncoding: "base64",
+  }));
+  body = JSON.parse(r.body);
+  assert("variant hex secret + base64 sig approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 5. Timestamp-mixed payload (Stripe-style `timestamp.body`).
+  r = await call(handler, platformPost({
+    taskId: "nt_var_tspayload", input: validInput({ proof_tx: proofTx(0xe5) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from(SECRET, "utf8"),
+    timestamp: String(Math.floor(Date.now() / 1000)),
+  }));
+  body = JSON.parse(r.body);
+  assert("variant timestamp.body payload approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 6. Negative control: env holds the right secret, request signed with a
+  //    DIFFERENT 32-byte key (hex sig) -> still 401. The union of accepted
+  //    encodings must not become an open door.
+  r = await call(handler, platformPost({
+    taskId: "nt_var_wrongkey", input: validInput({ proof_tx: proofTx(0xe6) }),
+    displayedSecret: RAW32.toString("hex"), keyBytes: WRONG32,
+  }));
+  assert("variant wrong 32-byte key still 401", r.statusCode === 401, `status=${r.statusCode}`);
+  // Restore the default test secret for any later checks.
+  process.env.AGENT_GAMES_HMAC_SECRET = SECRET;
+
   console.log(`\nRESULT: ${pass} passed, ${fail} failed (cold require ${coldMs}ms)`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error("TEST FATAL", e); process.exit(1); });
