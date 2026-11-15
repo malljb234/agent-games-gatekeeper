@@ -12,7 +12,12 @@ prove the decision with a Groth16 zero-knowledge proof that the platform
 re-verifies against its own registered verification key.
 
 1. **Verify the HMAC signature on the raw request body** before parsing
-   anything. Bad signature → 401, no further work.
+   anything. Bad signature → 401, no further work. The platform's secret
+   is 32 random bytes (official /rules §1.3); the dashboard shows it
+   encoded (hex or base64) and the platform signs with the raw bytes, so
+   verification accepts the secret hex/base64-decoded as well as raw, the
+   signature in hex or base64, and `timestamp.body` payloads — see
+   `lib/gatekeeper.js` (`verifyIncomingHmac`). A wrong key still 401s.
 2. **Decide deterministically** — a fixed checklist over the task fields
    (official trap encyclopedia, 7 varieties):
    - `proof_vk` must equal `registered_vk` and the registered key, else
