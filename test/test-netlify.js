@@ -160,17 +160,27 @@ function signedPost(taskId, input, secret = SECRET) {
   console.log("== platform variants: secret encodings / sig encodings ==");
   const RAW32 = crypto.randomBytes(32); // the platform's 32 raw secret bytes
   const WRONG32 = crypto.randomBytes(32);
-  function platformPost({ taskId, input, displayedSecret, keyBytes, sigEncoding = "hex", timestamp = null, headerName = "x-agent-games-signature" }) {
+  function canonicalJson(v) {
+    if (v === null || typeof v !== "object") return JSON.stringify(v);
+    if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+    return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(v[k])).join(",") + "}";
+  }
+  function platformPost({ taskId, input, displayedSecret, keyBytes, sigEncoding = "hex", timestamp = null, headerName = "x-agent-games-signature", payloadFn = null, envelopeExtra = {} }) {
     process.env.AGENT_GAMES_HMAC_SECRET = displayedSecret;
-    const raw = JSON.stringify(envelope(taskId, input));
+    const env = { ...envelope(taskId, input), ...envelopeExtra };
+    const raw = JSON.stringify(env);
     let payload = Buffer.from(raw, "utf8");
     const headers = { "content-type": "application/json" };
     if (timestamp) {
       headers["x-agent-games-timestamp"] = timestamp;
       payload = Buffer.concat([Buffer.from(timestamp, "utf8"), Buffer.from("."), Buffer.from(raw, "utf8")]);
     }
+    if (payloadFn) payload = payloadFn(raw, env);
     const sigBuf = crypto.createHmac("sha256", keyBytes).update(payload).digest();
-    headers[headerName] = sigEncoding === "base64" ? sigBuf.toString("base64") : sigBuf.toString("hex");
+    headers[headerName] =
+      sigEncoding === "base64" ? sigBuf.toString("base64") :
+      sigEncoding === "base64url" ? sigBuf.toString("base64url") :
+      sigBuf.toString("hex");
     return { method: "POST", path: "/.netlify/functions/gatekeeper", headers, body: raw };
   }
   function proofTx(n) {
@@ -231,6 +241,96 @@ function signedPost(taskId, input, secret = SECRET) {
     displayedSecret: RAW32.toString("hex"), keyBytes: WRONG32,
   }));
   assert("variant wrong 32-byte key still 401", r.statusCode === 401, `status=${r.statusCode}`);
+
+  // ------------------------------------------------------------------
+  // ROUND 2 (2026-11-15 ~14:38 WIB): the live preflight STILL 401s with
+  // the round-1 fix deployed. Log line: sig 64 chars (hex), body 171
+  // bytes, raw-string + base64-decoded keys both failed on the raw body.
+  // So the platform signs a different construction. Each case signs one
+  // candidate construction and must APPROVE.
+  // ------------------------------------------------------------------
+  console.log("== round-2 payload constructions (live preflight still 401) ==");
+
+  // 7. canonical JSON (sorted keys, compact).
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_canonjson", input: validInput({ proof_tx: proofTx(0xe7) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from(SECRET, "utf8"),
+    payloadFn: (raw) => Buffer.from(canonicalJson(JSON.parse(raw)), "utf8"),
+  }));
+  body = JSON.parse(r.body);
+  assert("r2 canonical-json approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 8. method + path + body (request-line style).
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_methodpath", input: validInput({ proof_tx: proofTx(0xe8) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from(SECRET, "utf8"),
+    payloadFn: (raw) => Buffer.concat([Buffer.from("POST\n/.netlify/functions/gatekeeper\n", "utf8"), Buffer.from(raw, "utf8")]),
+  }));
+  body = JSON.parse(r.body);
+  assert("r2 method-path-body approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 9. agent-id prefix.
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_agentid", input: validInput({ proof_tx: proofTx(0xe9) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from(SECRET, "utf8"),
+    payloadFn: (raw) => Buffer.concat([Buffer.from("malljb234-gatekeeper", "utf8"), Buffer.from(raw, "utf8")]),
+  }));
+  body = JSON.parse(r.body);
+  assert("r2 agentid+body approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 10. HMAC over the hex sha256 of the body.
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_shahex", input: validInput({ proof_tx: proofTx(0xea) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from(SECRET, "utf8"),
+    payloadFn: (raw) => Buffer.from(crypto.createHash("sha256").update(raw).digest("hex"), "utf8"),
+  }));
+  body = JSON.parse(r.body);
+  assert("r2 sha256hex-body approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 11. timestamp taken from the envelope BODY (no timestamp header).
+  const tsBody = String(Math.floor(Date.now() / 1000));
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_bodyts", input: validInput({ proof_tx: proofTx(0xeb) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from(SECRET, "utf8"),
+    envelopeExtra: { timestamp: tsBody },
+    payloadFn: (raw, env) => Buffer.concat([Buffer.from(String(env.timestamp), "utf8"), Buffer.from(".", "utf8"), Buffer.from(raw, "utf8")]),
+  }));
+  body = JSON.parse(r.body);
+  assert("r2 body-timestamp approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 12. key = sha256 of the displayed secret string.
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_shakey", input: validInput({ proof_tx: proofTx(0xec) }),
+    displayedSecret: SECRET, keyBytes: crypto.createHash("sha256").update(SECRET).digest(),
+  }));
+  body = JSON.parse(r.body);
+  assert("r2 sha256-of-secret key approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 13. Secret displayed as UNPADDED base64url (43 chars for 32 bytes) —
+  //     the round-1 decoder rejected length % 4 !== 0 inputs outright.
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_b64url_nopad", input: validInput({ proof_tx: proofTx(0xed) }),
+    displayedSecret: RAW32.toString("base64url"), keyBytes: RAW32,
+  }));
+  body = JSON.parse(r.body);
+  assert("r2 unpadded base64url secret approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 14. Signature as UNPADDED base64url (43 chars) — same decoder fix.
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_b64url_sig", input: validInput({ proof_tx: proofTx(0xee) }),
+    displayedSecret: SECRET, keyBytes: Buffer.from(SECRET, "utf8"), sigEncoding: "base64url",
+  }));
+  body = JSON.parse(r.body);
+  assert("r2 unpadded base64url sig approves", r.statusCode === 200 && body.decision === "APPROVE", `status=${r.statusCode} ${r.body.slice(0, 120)}`);
+
+  // 15. Negative control: canonical payload signed with a WRONG key.
+  r = await call(handler, platformPost({
+    taskId: "nt_r2_canonwrong", input: validInput({ proof_tx: proofTx(0xef) }),
+    displayedSecret: RAW32.toString("hex"), keyBytes: WRONG32,
+    payloadFn: (raw) => Buffer.from(canonicalJson(JSON.parse(raw)), "utf8"),
+  }));
+  assert("r2 canonical payload + wrong key still 401", r.statusCode === 401, `status=${r.statusCode}`);
+
   // Restore the default test secret for any later checks.
   process.env.AGENT_GAMES_HMAC_SECRET = SECRET;
 
