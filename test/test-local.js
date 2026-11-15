@@ -76,6 +76,36 @@ function post(bodyObj, secret = SECRET, rawOverride) {
     req.end(raw);
   });
 }
+function postWithSig(raw, sigValue, extraHeaders = {}) {
+  // POST with a caller-computed signature header value (any encoding).
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      `${BASE}/task`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-agent-games-signature": sigValue,
+          "content-length": Buffer.byteLength(raw),
+          ...extraHeaders,
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode,
+            headers: res.headers,
+            raw: Buffer.concat(chunks).toString("utf8"),
+          })
+        );
+      }
+    );
+    req.on("error", reject);
+    req.end(raw);
+  });
+}
 function get(pathname) {
   return new Promise((resolve, reject) => {
     http.get(`${BASE}${pathname}`, (res) => {
@@ -211,6 +241,46 @@ function assert(label, cond, extra = "") {
       req.end(raw);
     });
     assert("unsigned 401", unsigned.status === 401, `status=${unsigned.status}`);
+
+    console.log("== platform signing variants (preflight 401 diagnosis) ==");
+    // Base64-encoded signature, raw string key.
+    let rawV = JSON.stringify(envelope("gk_test_b64sig", validInput({
+      proof_tx: "0xe1c5000000000000000000000000000000000000000000000000000000008ff5",
+    })));
+    r = await postWithSig(
+      rawV,
+      crypto.createHmac("sha256", SECRET).update(rawV).digest("base64")
+    );
+    body = JSON.parse(r.raw);
+    assert("base64 sig approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // `sha256=`-prefixed hex signature.
+    rawV = JSON.stringify(envelope("gk_test_shaprefix", validInput({
+      proof_tx: "0xe2c5000000000000000000000000000000000000000000000000000000008ff5",
+    })));
+    r = await postWithSig(
+      rawV,
+      "sha256=" + crypto.createHmac("sha256", SECRET).update(rawV).digest("hex")
+    );
+    body = JSON.parse(r.raw);
+    assert("sha256= prefix approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // Timestamp-mixed payload: HMAC over `timestamp.body`, timestamp sent
+    // in x-agent-games-timestamp.
+    const ts = String(Math.floor(Date.now() / 1000));
+    rawV = JSON.stringify(envelope("gk_test_tspayload", validInput({
+      proof_tx: "0xe3c5000000000000000000000000000000000000000000000000000000008ff5",
+    })));
+    r = await postWithSig(
+      rawV,
+      crypto
+        .createHmac("sha256", SECRET)
+        .update(Buffer.concat([Buffer.from(ts), Buffer.from("."), Buffer.from(rawV)]))
+        .digest("hex"),
+      { "x-agent-games-timestamp": ts }
+    );
+    body = JSON.parse(r.raw);
+    assert("timestamp.body payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
   } finally {
     server.kill("SIGTERM");
   }
