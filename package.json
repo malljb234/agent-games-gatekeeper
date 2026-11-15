@@ -20,7 +20,8 @@
     "probe": "node probe-circuit.js",
     "start": "node server.js",
     "test": "node test/test-local.js",
-    "test:vercel": "node test/test-vercel.js"
+    "test:vercel": "node test/test-vercel.js",
+    "test:netlify": "node test/test-netlify.js"
   },
   "version": "1.0.0"
 }
