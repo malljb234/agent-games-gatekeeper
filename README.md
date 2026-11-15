@@ -72,24 +72,49 @@ node probe-circuit.js   # circuit truth: valid approve proves; trap approves
                         # and wrong rejects fail to prove; trap rejects prove
 node test/test-local.js # end-to-end HTTP: approve, trap, reuse, replay,
                         # bad HMAC (401), unsigned (401), no secret (503)
+node test/test-vercel.js # same cases through the Vercel handler (api/index.js)
+                        # + cold-start / first-proof latency measurement
 ```
 
-## Deploy (Render free tier)
+## Deploy (Vercel Hobby — current, free, no card)
 
-1. Sign up at render.com with GitHub (free, no card) and connect this repo.
-2. New → Web Service → pick this repo → Runtime Node → Build command
-   `npm install` → Start command `node server.js` → Free plan.
+The agent runs as a serverless function (`api/index.js`, same
+`lib/gatekeeper.js` core as `server.js`, so behaviour is identical).
+Register **`https://<project>.vercel.app/api`** as the agent endpoint.
+
+1. Sign up at vercel.com with GitHub (Hobby plan: $0, no card) and import
+   this repo.
+2. No build settings to change: `npm install` runs automatically, the
+   function is `api/index.js`, `vercel.json` sets `maxDuration: 60`.
 3. Add environment variable `AGENT_GAMES_HMAC_SECRET` = the secret from
    the Agent Games dashboard. (Do **not** put it in the repo.)
-4. Deploy, copy the `https://<name>.onrender.com` URL, and register it as
-   the agent endpoint at
-   https://agentgames.zkverify.io/dashboard/agents (Proof Gatekeeper).
-5. Keep the free instance warm: Render's free tier spins down after ~15 min
-   idle and a cold start can eat most of the 60-second window. Ping
-   `https://<name>.onrender.com/health` every few minutes (e.g. a cron job
-   or an uptime monitor) so the first task of a round does not time out.
+4. Deploy, open `https://<project>.vercel.app/api` in a browser — it
+   should answer `{"status":"ok", ...}` — and register that URL as the
+   agent endpoint at https://agentgames.zkverify.io/dashboard/agents
+   (Proof Gatekeeper).
+5. Keep the function warm during rounds: a cold start costs a few seconds
+   (first proof ~0.9s locally; well inside the 60s window), but pinging
+   `https://<project>.vercel.app/api` every few minutes during
+   17:30–03:30 WIB avoids cold starts entirely.
 6. In the Agent Games dashboard, run the signed preflight and at least one
    practice task before the next scored round.
+
+Vercel caveat: functions are stateless — `state.json` (seen proof refs +
+task cache) lives in `/tmp` and in memory, so a cold start can forget a
+seen `proof_tx`. The fail-closed checklist still decides correctly; only
+the PROOF_REUSED trap and byte-identical replay depend on remembered
+state. This is the price of the no-card free tier; a long-running host
+(Render) would keep state, but Render now demands a credit card (below).
+
+## Deploy (Render free tier — BLOCKED, needs a card)
+
+Render was the first choice, but since Nov 2026 new accounts hit an
+"Add Card" dialog (temporary $1 authorization) even on the Free plan,
+with no way to deploy without a card. Do **not** add a card for this.
+If a card is ever added, the steps are: connect this repo → New → Web
+Service → Runtime Node → Build `npm install` → Start `node server.js`
+→ Free plan → set `AGENT_GAMES_HMAC_SECRET` → deploy → register the
+`https://<name>.onrender.com` URL. `render.yaml` holds the same config.
 
 ## Event schedule (official)
 

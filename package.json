@@ -1,1 +1,26 @@
-{"author":"malljb234","dependencies":{"snarkjs":"0.7.6"},"description":"Proof Gatekeeper agent for zkVerify Agent Games Season 01 — deterministic decisions with Groth16 proofs","engines":{"node":">=18"},"keywords":["zkverify","agent-games","groth16","gatekeeper"],"license":"MIT","main":"server.js","name":"malljb234-gatekeeper","scripts":{"probe":"node probe-circuit.js","start":"node server.js","test":"node test/test-local.js"},"version":"1.0.0"}
+{
+  "author": "malljb234",
+  "dependencies": {
+    "snarkjs": "0.7.6"
+  },
+  "description": "Proof Gatekeeper agent for zkVerify Agent Games Season 01 \u2014 deterministic decisions with Groth16 proofs",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "zkverify",
+    "agent-games",
+    "groth16",
+    "gatekeeper"
+  ],
+  "license": "MIT",
+  "main": "server.js",
+  "name": "malljb234-gatekeeper",
+  "scripts": {
+    "probe": "node probe-circuit.js",
+    "start": "node server.js",
+    "test": "node test/test-local.js",
+    "test:vercel": "node test/test-vercel.js"
+  },
+  "version": "1.0.0"
+}
