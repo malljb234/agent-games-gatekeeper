@@ -74,9 +74,57 @@ node test/test-local.js # end-to-end HTTP: approve, trap, reuse, replay,
                         # bad HMAC (401), unsigned (401), no secret (503)
 node test/test-vercel.js # same cases through the Vercel handler (api/index.js)
                         # + cold-start / first-proof latency measurement
+node test/test-netlify.js # same cases through the Netlify handler
+                        # (netlify/functions/gatekeeper.js) + GET / and
+                        # base64-body cases + cold-start latency
 ```
 
-## Deploy (Vercel Hobby — current, free, no card)
+## Deploy (Netlify — current attempt, free, no card)
+
+The agent runs as a serverless function
+(`netlify/functions/gatekeeper.js`, same `lib/gatekeeper.js` core as
+`server.js`, so behaviour is identical). Register
+**`https://<site>.netlify.app/.netlify/functions/gatekeeper`** as the
+agent endpoint (netlify.toml also rewrites `/`, `/health`, `/task` and
+`/api` to the function, so the site root answers health too).
+
+1. Sign up at netlify.com with GitHub (Free plan: $0, no card) and
+   import this repo.
+2. No build settings to change: `netlify.toml` sets the functions
+   directory, bundles `circuits/**` with the function via
+   `included_files`, and `npm install` runs automatically.
+3. Add environment variable `AGENT_GAMES_HMAC_SECRET` = the secret from
+   the Agent Games dashboard. (Do **not** put it in the repo.)
+4. Deploy, open
+   `https://<site>.netlify.app/.netlify/functions/gatekeeper` in a
+   browser — it should answer `{"status":"ok", ...}` — and register
+   that URL as the agent endpoint at
+   https://agentgames.zkverify.io/dashboard/agents (Proof Gatekeeper).
+5. Keep the function warm during rounds: ping the endpoint every few
+   minutes during 17:30–03:30 WIB (a cold start costs a few seconds;
+   first proof ~0.9s locally; well inside the 60s window, and inside
+   Netlify's 10s free-plan function limit).
+6. In the Agent Games dashboard, run the signed preflight and at least
+   one practice task before the next scored round.
+
+Netlify caveats: functions are stateless — `state.json` lives in `/tmp`
+and in memory, so a cold start can forget a seen `proof_tx` (same
+trade-off as Vercel). Free plan = 300 credits/month, hard cap, no
+overage billing — our usage (a few deploys + hundreds of ~2s
+invocations) is a few credits. **If Netlify asks for phone verification
+or a credit card at signup, STOP — do not enter the phone number or a
+card.**
+
+## Deploy (Vercel Hobby — BLOCKED 12h, phone verification)
+
+Vercel was the first serverless choice, but on 15 Nov 2026 ~11:17 WIB
+signup hit SMS phone verification that failed (session expired, "Too
+many requests") and the number is now temporarily blocked for 12 hours
+(until ~23:17 WIB). Do **not** retry the phone step until the block
+lifts, and do not re-click Continue repeatedly. A reminder is set for
+23:20 WIB to retry once, carefully. The Vercel code path
+(`api/index.js`) still works and is tested (15/15); only the account
+step is blocked.
 
 The agent runs as a serverless function (`api/index.js`, same
 `lib/gatekeeper.js` core as `server.js`, so behaviour is identical).
