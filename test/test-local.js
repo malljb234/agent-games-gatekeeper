@@ -281,6 +281,83 @@ function assert(label, cond, extra = "") {
     );
     body = JSON.parse(r.raw);
     assert("timestamp.body payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    console.log("== round-2 payload constructions (preflight still 401 live) ==");
+    // The live preflight (171-byte body, hex sig) failed with BOTH the
+    // raw-string and base64-decoded keys against the raw body, so the
+    // platform must sign a different construction. Each case below signs
+    // one candidate construction with the test secret and must APPROVE.
+    function canonicalJson(v) {
+      if (v === null || typeof v !== "object") return JSON.stringify(v);
+      if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+      return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(v[k])).join(",") + "}";
+    }
+    const hmacBuf = (key, payload) => crypto.createHmac("sha256", key).update(payload).digest();
+    function variantTx(n) {
+      return "0x" + n.toString(16).padStart(2, "0") + "c6" + "0".repeat(56) + "8ff6";
+    }
+
+    // 1. canonical JSON: keys sorted recursively, compact. The raw body is
+    //    pretty-printed with REVERSED key order, so raw != canonical.
+    let envObj = envelope("gk_test_canonjson", validInput({ proof_tx: variantTx(0xf1) }));
+    const reversed = {};
+    for (const k of Object.keys(envObj).reverse()) reversed[k] = envObj[k];
+    rawV = JSON.stringify(reversed, null, 2);
+    r = await postWithSig(rawV, hmacBuf(SECRET, canonicalJson(JSON.parse(rawV))).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("canonical-json payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+    assert("canonical-json response is HMAC-signed", checkResponseSignature(r));
+
+    // 2. re-stringified JSON: pretty raw body, signature over the compact
+    //    re-serialisation (same key order, no whitespace).
+    rawV = JSON.stringify(envelope("gk_test_restring", validInput({ proof_tx: variantTx(0xf2) })), null, 2);
+    r = await postWithSig(rawV, hmacBuf(SECRET, JSON.stringify(JSON.parse(rawV))).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("restringified-json payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 3. method + path + body (request-line style).
+    rawV = JSON.stringify(envelope("gk_test_methodpath", validInput({ proof_tx: variantTx(0xf3) })));
+    r = await postWithSig(rawV, hmacBuf(SECRET, "POST\n/.netlify/functions/gatekeeper\n" + rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("method-path-body payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 4. path + body.
+    rawV = JSON.stringify(envelope("gk_test_pathbody", validInput({ proof_tx: variantTx(0xf4) })));
+    r = await postWithSig(rawV, hmacBuf(SECRET, "/.netlify/functions/gatekeeper" + rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("path+body payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 5. agent-id prefix.
+    rawV = JSON.stringify(envelope("gk_test_agentid", validInput({ proof_tx: variantTx(0xf5) })));
+    r = await postWithSig(rawV, hmacBuf(SECRET, "malljb234-gatekeeper" + rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("agentid+body payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 6. HMAC over the hex sha256 of the body.
+    rawV = JSON.stringify(envelope("gk_test_shahex", validInput({ proof_tx: variantTx(0xf6) })));
+    r = await postWithSig(rawV, hmacBuf(SECRET, crypto.createHash("sha256").update(rawV).digest("hex")).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("sha256hex-body payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 7. timestamp taken from the envelope BODY (no timestamp header).
+    const tsBody = String(Math.floor(Date.now() / 1000));
+    const envTs = { ...envelope("gk_test_bodyts", validInput({ proof_tx: variantTx(0xf7) })), timestamp: tsBody };
+    rawV = JSON.stringify(envTs);
+    r = await postWithSig(rawV, hmacBuf(SECRET, tsBody + "." + rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("body-timestamp payload approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 8. key = sha256 of the displayed secret string.
+    rawV = JSON.stringify(envelope("gk_test_shakey", validInput({ proof_tx: variantTx(0xf8) })));
+    r = await postWithSig(rawV, hmacBuf(crypto.createHash("sha256").update(SECRET).digest(), rawV).toString("hex"));
+    body = JSON.parse(r.raw);
+    assert("sha256-of-secret key approves", r.status === 200 && body.decision === "APPROVE", r.raw.slice(0, 200));
+
+    // 9. Negative control: canonical payload signed with a WRONG key.
+    envObj = envelope("gk_test_canonwrong", validInput({ proof_tx: variantTx(0xf9) }));
+    rawV = JSON.stringify(envObj, null, 2);
+    r = await postWithSig(rawV, hmacBuf("wrong-secret", canonicalJson(JSON.parse(rawV))).toString("hex"));
+    assert("canonical payload + wrong key still 401", r.status === 401, `status=${r.status}`);
   } finally {
     server.kill("SIGTERM");
   }
